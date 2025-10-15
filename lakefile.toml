@@ -1,0 +1,6 @@
+name = "elabtest"
+version = "0.1.0"
+defaultTargets = ["Elabtest"]
+
+[[lean_lib]]
+name = "Elabtest"
