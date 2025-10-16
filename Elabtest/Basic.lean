@@ -17,10 +17,6 @@ def makeHListLit {m} [Monad m] [MonadQuotation m] : List (TSyntax `term) → m (
 
 inductive Tp | unit | array (n : Nat) (elem : Tp)
 
-def Tp.denote : Tp → Type
-| unit => Unit
-| array n elem => Vector elem.denote n
-
 inductive Val (rep : Tp → Type) : Tp → Type where
 | unit : Val rep .unit
 | array : (v : Vector (rep elemTp) n) → Val rep (elemTp.array n)
@@ -35,43 +31,24 @@ structure Lambda (rep : Tp → Type) where
 structure Function where
   body : ∀ (rep : Tp → Type), Lambda rep
 
-declare_syntax_cat decl
-declare_syntax_cat expr
-
-syntax (name := myDef) "my_def" ident ":=" expr : command
-syntax "{" sepBy(expr, ";") "}": expr
-syntax "mkArray(" expr,* ")" : expr
-syntax "#unit" : expr
-
-class MonadUtil (m : Type → Type) extends Monad m, MonadQuotation m, MonadExceptOf Exception m, MonadError m
-
-@[default_instance]
-instance {m} [Monad m] [MonadQuotation m] [MonadExceptOf Exception m] [MonadError m] : MonadUtil m where
-
 structure DSLState where
   nextFresh : Nat
 
-class MonadDSL (m : Type → Type) extends MonadUtil m, MonadStateOf DSLState m
+class MonadDSL (m : Type → Type) extends Monad m, MonadQuotation m, MonadStateOf DSLState m
 
 @[default_instance]
-instance {m} [MonadUtil m] [MonadStateOf DSLState m] : MonadDSL m where
+instance {m} [Monad m] [MonadQuotation m] [MonadStateOf DSLState m] : MonadDSL m where
 
-def MonadDSL.run [Monad m] [MonadQuotation m] [MonadExceptOf Exception m] [MonadError m]
-    (a : StateT DSLState m α) : m α :=
+def MonadDSL.run [Monad m] [MonadQuotation m] (a : StateT DSLState m α) : m α :=
   StateT.run' a ⟨0⟩
 
-def nameOf {m} [MonadDSL m] : Option Lean.Ident → m Lean.Ident
-| none =>
+def nameOf {m} [MonadDSL m] : m Lean.Ident :=
   modifyGet fun s =>
-  (mkIdent (.mkSimple s!"#v_{s.nextFresh}"), { s with nextFresh := s.nextFresh.succ })
-| some n => pure n
+    (mkIdent (.mkSimple s!"#v_{s.nextFresh}"), { s with nextFresh := s.nextFresh.succ })
 
-def wrapInLet {m} [MonadDSL m]
-    (e : TSyntax `term)
-    (ident : Option Lean.Ident)
-    (k : Option $ TSyntax `term → m (TSyntax `term))
-  : m (TSyntax `term) := do
-  let ident ← nameOf ident
+def wrapInLet {m} [MonadDSL m] (e : TSyntax `term) (k : Option $ TSyntax `term → m (TSyntax `term))
+    : m (TSyntax `term) := do
+  let ident ← nameOf
   match k with
   | some k => do
     let rest ← k ident
@@ -79,96 +56,25 @@ def wrapInLet {m} [MonadDSL m]
   | none => do
     pure e
 
-open Elab
+def makeBlock {m} [MonadDSL m] (fuel : Nat) (k : Option $ TSyntax `term → m (TSyntax `term))
+  : m (TSyntax `term) := do
+  match fuel with
+  | n + 1 => wrapInLet (←``(Val.unit)) $ some fun _ => makeBlock n k
+  | 0 =>
+    let ⟨numBinders⟩ ← get
+    let names := List.range numBinders |>.map (fun i => ⟨mkIdent (.mkSimple s!"#v_{i}")⟩)
+    let args ← makeHListLit names
+    wrapInLet (←``(Val.call _ (Tp.array 0 Tp.unit) $args)) k
 
-mutual
+def makeWeirdExpr {m} [MonadDSL m] (fuel : Nat) : m (TSyntax `term) := do
+  makeBlock fuel none
 
-partial def makeBlock {m} [MonadDSL m]
-    (items : List (TSyntax `expr))
-    (binder : Option Lean.Ident)
-    (k : Option $ TSyntax `term → m (TSyntax `term))
-  : m (TSyntax `term) := match items with
-| head :: next :: rest => do
-  match head with
-  | e => do makeExpr e none $ some fun _ => makeBlock (next :: rest) binder k
-| [last] => makeExpr last binder k
-| _ => throwError "Empty blocks are invalid"
-
-partial def makeExpr {m} [MonadDSL m]
-    (expr : TSyntax `expr)
-    (binder : Option Lean.Ident)
-    (k : Option (TSyntax `term → m (TSyntax `term))) : m (TSyntax `term) := do
-  match expr with
-  | `(expr|#unit) => do wrapInLet (←``(Val.unit)) binder k
-  | `(expr|{ $exprs;* }) => do
-    let block ← makeBlock exprs.getElems.toList binder none
-    wrapInLet block binder k
-  | `(expr|mkArray( $args,* )) =>
-    makeArgs args.getElems.toList fun args => do
-      let argVals ← makeHListLit args
-      wrapInLet
-        (←``(Val.call _ (Tp.array 0 Tp.unit) $argVals))
-        binder
-        k
-  | _ => throwUnsupportedSyntax
-
-partial def makeArgs {m} [MonadDSL m]
-    (args : List (TSyntax `expr))
-    (k : List (TSyntax `term) → m (TSyntax `term))
-  : m (TSyntax `term) := match args with
-| [] => k []
-| h :: t => makeExpr h none (some fun h => makeArgs t fun t => k (h :: t))
-
-end
-
-open Command
-
-@[command_elab myDef]
-def elabMyDef : CommandElab := fun stx =>
-  match stx with
-| `(my_def $id:ident := $body:expr) => do
-  let body ← MonadDSL.run do
-    makeExpr body none none
-
-  let lambda ← `(fun rep => {
-        argTps := [],
-        outTp := .unit,
-        body := fun args => match args with
-          | h![] => $body
-      }
-    )
-
+open Elab.Command in
+elab "#foo" : command => do
+  let body ← MonadDSL.run $ makeWeirdExpr 50
+  let lambda ← `(fun rep => ⟨[], _, fun args => match args with | h![] => $body⟩)
   let func ← ``(Function.mk $lambda)
-  let decl ← `(def $id : Function := $func)
+  let decl ← `(def $(mkIdent `foo) : Function := $func)
   elabCommand decl
-| _ => throwUnsupportedSyntax
 
-
--- set_option trace.profiler.threshold 3
--- set_option trace.profiler true
--- set_option trace.Compiler.elimDeadBranches true
--- set_option maxHeartbeats 10000000
-
-my_def asdf := {
-  mkArray(
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit,
-    #unit, #unit, #unit, #unit
-  );
-  #unit
-}
-
-#print asdf
+#foo
